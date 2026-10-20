@@ -1,0 +1,45 @@
+---
+name: Refresh add-on catalogue
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      full:
+        description: Rebuild from all discovery queries
+        required: false
+        type: boolean
+        default: false
+permissions:
+  contents: write
+concurrency:
+  group: refresh-add-on-catalogue
+  cancel-in-progress: false
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: actions/cache@v4
+        with:
+          path: _http_v1
+          key: cataloguer-http-v1-${{ github.run_id }}
+          restore-keys: |
+            cataloguer-http-v1-
+      - name: Collect current add-ons
+        env:
+          RELEASE_JSON_ADDONS_GITHUB_TOKEN: ${{ github.token }}
+        run: uv run python -m cataloguer collect --merge ${{ inputs.full && '--full' || '' }}
+      - name: Commit refreshed catalogue
+        run: |
+          if git diff --quiet -- addons.csv catalogue-state.json; then
+            exit 0
+          fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add addons.csv catalogue-state.json
+          git commit -m "Refresh add-on catalogue"
+          git push

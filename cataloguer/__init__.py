@@ -6,6 +6,8 @@ import enum
 import io
 import json
 import re
+import struct
+import zlib
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import (
     AbstractAsyncContextManager,
@@ -13,7 +15,7 @@ from contextlib import (
     asynccontextmanager,
 )
 from typing import Any, Literal, NewType, Protocol
-from zipfile import ZipFile
+from zipfile import BadZipFile, ZipFile
 
 import aiohttp
 import structlog
@@ -94,7 +96,9 @@ _EXPIRE_URLS: ExpirationPatterns = {
 
 
 class _Get(Protocol):
-    def __call__(self, url: str | URL) -> AbstractAsyncContextManager[aiohttp.ClientResponse]: ...
+    def __call__(
+        self, url: str | URL, **kwargs: Any
+    ) -> AbstractAsyncContextManager[aiohttp.ClientResponse]: ...
 
 
 class ReleaseJsonFlavor(enum.StrEnum):
@@ -183,13 +187,29 @@ class Project:
     wowi_id: str | None
     has_release_json: bool
     last_seen: dt.datetime
+    release_tag_prefix: str | None = None
+    asset_name_pattern: str | None = None
+    folders: tuple[str, ...] = ()
 
     @classmethod
-    def from_csv_row(cls, values: object):
-        return _addons_csv_converter.structure(values, cls)
+    def from_csv_row(cls, values: Mapping[str, Any]):
+        row = dict(values)
+        for name in (
+            "description",
+            "curse_id",
+            "wago_id",
+            "wowi_id",
+            "release_tag_prefix",
+            "asset_name_pattern",
+        ):
+            row[name] = row.get(name) or None
+        row["folders"] = tuple(filter(None, row.get("folders", "").split(",")))
+        return _addons_csv_converter.structure(row, cls)
 
     def to_csv_row(self):
-        return _addons_csv_converter.unstructure(self)
+        row = _addons_csv_converter.unstructure(self)
+        row["folders"] = ",".join(self.folders)
+        return row
 
 
 PROJECT_FIELD_NAMES = tuple(f.name for f in fields(Project))
@@ -234,6 +254,420 @@ def _interface_numbers_to_flavours(interface_numbers: Iterable[int]):
             if interface_number in interface_range:
                 yield flavor
                 break
+
+
+@frozen
+class ArchiveAnalysis:
+    flavors: ProjectFlavors
+    folders: tuple[str, ...]
+    curse_id: str | None = None
+    wago_id: str | None = None
+    wowi_id: str | None = None
+
+
+@frozen
+class ReleaseAsset:
+    name: str
+    size: int
+    download_url: str
+    analysis: ArchiveAnalysis | None = None
+
+
+@frozen
+class ReleaseInfo:
+    tag_name: str
+    published_at: dt.datetime
+    prerelease: bool
+    draft: bool
+    assets: tuple[ReleaseAsset, ...] = field(converter=tuple)
+
+
+@frozen
+class RepositoryInfo:
+    id: str = field(converter=str)
+    name: str
+    full_name: str
+    url: str
+    description: str | None
+
+
+def analyse_addon_zip(contents: bytes, filename: str) -> ArchiveAnalysis | None:
+    del filename
+    try:
+        with ZipFile(io.BytesIO(contents)) as addon_zip:
+            toc_rows: list[tuple[str, ReleaseJsonFlavor | None, dict[str, str]]] = []
+            for path in addon_zip.namelist():
+                match = _top_level_toc_name_pattern.fullmatch(path)
+                if not match:
+                    continue
+                try:
+                    toc = _parse_toc_file(addon_zip.read(path).decode("utf-8-sig"))
+                except (KeyError, UnicodeDecodeError):
+                    continue
+                suffix = match["flavor"]
+                toc_rows.append(
+                    (
+                        match["name"],
+                        _TOC_ALIASES.get(suffix.lower()) if suffix else None,
+                        toc,
+                    )
+                )
+    except (BadZipFile, OSError):
+        return None
+    if not toc_rows:
+        return None
+    flavors = {
+        flavor
+        for _, suffix_flavor, toc in toc_rows
+        for flavor in (
+            (suffix_flavor,)
+            if suffix_flavor is not None
+            else tuple(
+                _interface_numbers_to_flavours(
+                    _extract_interface_numbers(toc.get("Interface", ""))
+                )
+            )
+        )
+    }
+    folders = tuple(sorted({folder for folder, _, _ in toc_rows}, key=str.lower))
+    if not flavors or not folders:
+        return None
+
+    def first(key: str) -> str | None:
+        return next((toc[key] for _, _, toc in toc_rows if toc.get(key)), None)
+
+    return ArchiveAnalysis(
+        flavors=ProjectFlavors(frozenset(flavors)),
+        folders=folders,
+        curse_id=first("X-Curse-Project-ID"),
+        wago_id=first("X-Wago-ID"),
+        wowi_id=first("X-WoWI-ID"),
+    )
+
+
+_STREAM_TAG = re.compile(r"^(.+)/v\d", re.I)
+_LANGUAGE_NAMES = {
+    "dede": "German",
+    "eses": "Spanish (Europe)",
+    "esmx": "Spanish (Mexico)",
+    "frfr": "French",
+    "itit": "Italian",
+    "kokr": "Korean",
+    "ptbr": "Portuguese",
+    "ruru": "Russian",
+    "zhcn": "Chinese (Simplified)",
+    "zhtw": "Chinese (Traditional)",
+}
+
+
+def _display_words(value: str) -> str:
+    raw_parts = re.split(r"[-_]", value)
+    language = _LANGUAGE_NAMES.get(raw_parts[-1].lower())
+    if language:
+        raw_parts = raw_parts[:-1]
+    parts = [
+        word
+        for part in raw_parts
+        for word in re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", part).split()
+    ]
+    words = " ".join(part.capitalize() for part in parts if part)
+    if language:
+        return f"{words} ({language})"
+    return f"{words} (All)" if value.lower().endswith("-audio") else words
+
+
+def _release_rows(
+    repo: RepositoryInfo,
+    release: ReleaseInfo,
+    now: dt.datetime,
+    tag_prefix: str | None,
+) -> list[Project]:
+    groups: dict[tuple[str, ...], list[ReleaseAsset]] = {}
+    for asset in release.assets:
+        if asset.analysis is not None:
+            groups.setdefault(asset.analysis.folders, []).append(asset)
+    rows: list[Project] = []
+    for folders, variants in groups.items():
+        asset = next(
+            (candidate for candidate in variants if "nolib" not in candidate.name.lower()),
+            variants[0],
+        )
+        analysis = asset.analysis
+        assert analysis is not None
+        identity = tag_prefix.rstrip("/") if tag_prefix else asset.name
+        safe_identity = re.sub(r"[^a-z0-9]+", "-", identity.lower()).strip("-")
+        if tag_prefix:
+            name = _display_words(identity)
+            if repo.name.lower().startswith("spoken") and not name.lower().startswith("spoken"):
+                name = f"Spoken {name}"
+        elif len(groups) > 1:
+            name = _display_words(folders[0])
+        else:
+            name = repo.name
+        size_mib = max(1, round(asset.size / (1024 * 1024)))
+        description = (repo.description or "GitHub author release").strip()
+        description = f"{description} · {size_mib} MiB"
+        row_id = repo.id if not tag_prefix and len(groups) == 1 else f"{repo.id}:{safe_identity}"
+        rows.append(
+            Project(
+                id=row_id,
+                name=name,
+                full_name=repo.full_name,
+                url=repo.url,
+                description=description,
+                last_updated=release.published_at,
+                flavors=analysis.flavors,
+                curse_id=analysis.curse_id,
+                wago_id=analysis.wago_id,
+                wowi_id=analysis.wowi_id,
+                has_release_json=False,
+                last_seen=now,
+                release_tag_prefix=tag_prefix,
+                asset_name_pattern=asset.name,
+                folders=folders,
+            )
+        )
+    return rows
+
+
+def expand_repository_releases(
+    repo: RepositoryInfo,
+    releases: Sequence[ReleaseInfo],
+    *,
+    now: dt.datetime,
+) -> list[Project]:
+    eligible = [release for release in releases if not release.draft and not release.prerelease]
+    streams: dict[str, list[ReleaseInfo]] = {}
+    ordinary: list[ReleaseInfo] = []
+    for release in eligible:
+        match = _STREAM_TAG.match(release.tag_name)
+        if match:
+            streams.setdefault(match[1] + "/", []).append(release)
+        else:
+            ordinary.append(release)
+    rows: list[Project] = []
+    for prefix, candidates in sorted(streams.items()):
+        latest = max(candidates, key=lambda item: item.published_at)
+        rows.extend(_release_rows(repo, latest, now, prefix))
+    if ordinary:
+        latest = max(ordinary, key=lambda item: item.published_at)
+        rows.extend(_release_rows(repo, latest, now, None))
+    return rows
+
+
+def _selected_releases(releases: Sequence[ReleaseInfo]) -> list[ReleaseInfo]:
+    eligible = [release for release in releases if not release.draft and not release.prerelease]
+    streams: dict[str, list[ReleaseInfo]] = {}
+    ordinary: list[ReleaseInfo] = []
+    for release in eligible:
+        match = _STREAM_TAG.match(release.tag_name)
+        if match:
+            streams.setdefault(match[1] + "/", []).append(release)
+        else:
+            ordinary.append(release)
+    selected = [
+        max(candidates, key=lambda item: item.published_at) for candidates in streams.values()
+    ]
+    if ordinary:
+        selected.append(max(ordinary, key=lambda item: item.published_at))
+    return selected
+
+
+async def _range_bytes(get: _Get, url: str, start: int, end: int) -> bytes:
+    async with get(
+        url, headers={"Range": f"bytes={start}-{end}"}, expire_after=0
+    ) as response:
+        if response.status == 206:
+            return await response.read()
+        if response.status == 200 and response.content_length is not None:
+            if response.content_length <= 8 * 1024 * 1024:
+                body = await response.read()
+                return body[start : end + 1]
+        raise ValueError(f"asset server ignored bounded range for {url}")  # noqa: TRY003
+
+
+async def _analyse_remote_zip(get: _Get, asset: ReleaseAsset) -> ArchiveAnalysis | None:
+    if asset.size <= 0:
+        return None
+    tail_size = min(asset.size, 128 * 1024)
+    tail = await _range_bytes(get, asset.download_url, asset.size - tail_size, asset.size - 1)
+    marker = tail.rfind(b"PK\x05\x06")
+    if marker < 0 or len(tail) - marker < 22:
+        return None
+    _, _, _, _, entries, central_size, central_offset, _ = struct.unpack_from(
+        "<4s4H2IH", tail, marker
+    )
+    if not entries or central_size > 16 * 1024 * 1024:
+        return None
+    central = await _range_bytes(
+        get, asset.download_url, central_offset, central_offset + central_size - 1
+    )
+    members: list[tuple[str, int, int, int]] = []
+    cursor = 0
+    while cursor + 46 <= len(central):
+        values = struct.unpack_from("<4s6H3I5H2I", central, cursor)
+        if values[0] != b"PK\x01\x02":
+            break
+        compression, compressed_size = values[4], values[8]
+        name_length, extra_length, comment_length, local_offset = (
+            values[10],
+            values[11],
+            values[12],
+            values[16],
+        )
+        name_start = cursor + 46
+        name = central[name_start : name_start + name_length].decode("utf-8", "replace")
+        if _top_level_toc_name_pattern.fullmatch(name) and compressed_size <= 1024 * 1024:
+            members.append((name, local_offset, compression, compressed_size))
+        cursor = name_start + name_length + extra_length + comment_length
+    if not members:
+        return None
+    toc_files: list[tuple[str, str]] = []
+    for name, local_offset, compression, compressed_size in members:
+        header = await _range_bytes(get, asset.download_url, local_offset, local_offset + 29)
+        if len(header) != 30 or header[:4] != b"PK\x03\x04":
+            return None
+        local = struct.unpack("<4s5H3I2H", header)
+        name_length, extra_length = local[9], local[10]
+        data_start = local_offset + 30 + name_length + extra_length
+        payload = await _range_bytes(
+            get, asset.download_url, data_start, data_start + compressed_size - 1
+        )
+        if compression == 0:
+            decoded = payload
+        elif compression == 8:
+            decoded = zlib.decompress(payload, -15)
+        else:
+            continue
+        try:
+            toc_files.append((name, decoded.decode("utf-8-sig")))
+        except UnicodeDecodeError:
+            continue
+    return analyse_addon_zip(addon_zip_bytes(toc_files), asset.name) if toc_files else None
+
+
+def addon_zip_bytes(files: Sequence[tuple[str, str]]) -> bytes:
+    output = io.BytesIO()
+    with ZipFile(output, "w") as archive:
+        for name, contents in files:
+            archive.writestr(name, contents)
+    return output.getvalue()
+
+
+async def _graphql_repositories(
+    client: aiohttp.ClientSession,
+    names: Sequence[str],
+) -> list[dict[str, Any]]:
+    async def query(batch: Sequence[str], release_count: int = 100) -> list[dict[str, Any]]:
+        declarations = ", ".join(
+            f"$owner{i}:String!,$name{i}:String!" for i in range(len(batch))
+        )
+        fields = "\n".join(
+            f"r{i}:repository(owner:$owner{i},name:$name{i}){{"
+            "databaseId name nameWithOwner url description "
+            f"releases(first:{release_count},orderBy:{{field:CREATED_AT,direction:DESC}}){{"
+            "nodes{tagName publishedAt isPrerelease isDraft "
+            "releaseAssets(first:100){nodes{name size downloadUrl}}}}}"
+            for i in range(len(batch))
+        )
+        variables = {
+            key: value
+            for i, full_name in enumerate(batch)
+            for key, value in (
+                (f"owner{i}", full_name.split("/", 1)[0]),
+                (f"name{i}", full_name.split("/", 1)[1]),
+            )
+        }
+        async with client.post(
+            "https://api.github.com/graphql",
+            json={"query": f"query({declarations}){{{fields}}}", "variables": variables},
+        ) as response:
+            payload = await response.json()
+        if response.status < 400 and not payload.get("errors"):
+            return [value for value in payload["data"].values() if value]
+        if len(batch) > 1:
+            middle = len(batch) // 2
+            left, right = await asyncio.gather(
+                query(batch[:middle], release_count),
+                query(batch[middle:], release_count),
+            )
+            return left + right
+        if release_count > 20:
+            return await query(batch, 20)
+        logger.warning("GitHub GraphQL repository skipped", repository=batch[0],
+                       errors=payload.get("errors", response.status))
+        return []
+
+    rows: list[dict[str, Any]] = []
+    for batch_start in range(0, len(names), 5):
+        rows.extend(await query(names[batch_start : batch_start + 5]))
+    return rows
+
+
+async def _projects_from_graphql(
+    client: aiohttp.ClientSession,
+    get: _Get,
+    repositories: Sequence[dict[str, Any]],
+) -> set[Project]:
+    semaphore = asyncio.Semaphore(16)
+
+    async def inspect(asset: ReleaseAsset) -> ReleaseAsset:
+        if not asset.name.lower().endswith(".zip"):
+            return asset
+        async with semaphore:
+            try:
+                analysis = await _analyse_remote_zip(get, asset)
+            except (aiohttp.ClientError, OSError, ValueError, zlib.error):
+                logger.warning("unable to inspect add-on ZIP", asset=asset.download_url)
+                analysis = None
+        return ReleaseAsset(asset.name, asset.size, asset.download_url, analysis)
+
+    del client
+    now = dt.datetime.now(dt.UTC)
+
+    async def process(row: dict[str, Any]) -> set[Project]:
+        repo = RepositoryInfo(
+            id=row["databaseId"],
+            name=row["name"],
+            full_name=row["nameWithOwner"],
+            url=row["url"],
+            description=row["description"],
+        )
+        releases = [
+            ReleaseInfo(
+                tag_name=node["tagName"],
+                published_at=dt.datetime.fromisoformat(
+                    node["publishedAt"].replace("Z", "+00:00")
+                ),
+                prerelease=node["isPrerelease"],
+                draft=node["isDraft"],
+                assets=tuple(
+                    ReleaseAsset(asset["name"], asset["size"], asset["downloadUrl"])
+                    for asset in node["releaseAssets"]["nodes"]
+                ),
+            )
+            for node in row["releases"]["nodes"]
+            if node["publishedAt"]
+        ]
+        selected = _selected_releases(releases)
+
+        async def inspect_release(release: ReleaseInfo) -> ReleaseInfo:
+            return ReleaseInfo(
+                tag_name=release.tag_name,
+                published_at=release.published_at,
+                prerelease=release.prerelease,
+                draft=release.draft,
+                assets=tuple(await asyncio.gather(
+                    *(inspect(asset) for asset in release.assets))),
+            )
+
+        inspected = await asyncio.gather(*(inspect_release(release) for release in selected))
+        return set(expand_repository_releases(repo, inspected, now=now))
+
+    output: set[Project] = set()
+    for projects in await asyncio.gather(*(process(row) for row in repositories)):
+        output.update(projects)
+    return output
 
 
 async def _find_addon_repos(
@@ -506,32 +940,67 @@ async def _make_http_client(token: str):
 async def get_projects(
     *,
     token: str,
+    existing: Sequence[Project] = (),
+    full: bool = False,
     search_params: Sequence[tuple[Literal["code", "repositories", "user_repositories"], str]]
     | None = None,
-):
+    since: dt.datetime | None = None,
+) -> tuple[set[Project], set[str]]:
     if search_params is None:
-        search_params = [
-            ("code", "path:.github/workflows bigwigsmods packager"),
-            ("code", "path:.github/workflows CF_API_KEY"),
-            ("repositories", "topic:wow-addon"),
-            ("repositories", "topic:world-of-warcraft-addon"),
-            ("repositories", "topic:warcraft-addon"),
-            ("repositories", "topics:>2 topic:world-of-warcraft topic:addon"),
+        repository_queries = [
+            "topic:wow-addon",
+            "topic:world-of-warcraft-addon",
+            "topic:warcraft-addon",
+            "topic:wow-addons",
+            "topic:wowaddon",
+            "topic:worldofwarcraft",
+            "topic:wow",
+            "topic:classic-wow",
+            "topic:wow-classic",
+            "topic:wow-forever",
+            "topic:elvui topic:plugin",
+            "topic:world-of-warcraft language:lua",
+            "topics:>2 topic:world-of-warcraft topic:addon",
         ]
+        if full or not existing:
+            search_params = [
+                ("code", 'extension:toc "## Interface"'),
+                ("code", '"## X-Curse-Project-ID" extension:toc'),
+                ("code", '"## X-Wago-ID" extension:toc'),
+                ("code", '"## X-WoWI-ID" extension:toc'),
+                ("code", 'filename:release.json "releases"'),
+                ("code", "path:.github/workflows bigwigsmods packager"),
+                ("code", "path:.github/workflows CF_API_KEY"),
+                *(
+                    ("code", f'"## Interface: {interface}" extension:toc')
+                    for interface in ("16001", "115", "205", "505", "120")
+                ),
+                *(("repositories", query) for query in repository_queries),
+                *(
+                    ("repositories", f"{topic} {stars}")
+                    for topic in ("topic:wow", "topic:worldofwarcraft", "topic:elvui")
+                    for stars in ("stars:0", "stars:1..5", "stars:6..50", "stars:>50")
+                ),
+            ]
+        else:
+            since_date = (since or min(
+                project.last_seen for project in existing
+            )).astimezone(dt.UTC).isoformat().replace("+00:00", "Z")
+            search_params = [
+                ("repositories", f"{query} pushed:>={since_date}")
+                for query in repository_queries
+            ]
 
-    async with _make_http_client(token) as (_, get):
+    async with _make_http_client(token) as (client, get):
         deduped_repos = {
             r["full_name"]: r
             async for r in _find_addon_repos(get, search_params)
             if not r["full_name"].startswith(REPO_EXCLUDES)
         }
-        projects = {
-            r
-            for c in asyncio.as_completed(_parse_repo(get, r) for r in deduped_repos.values())
-            for r in (await c,)
-            if r
-        }
-        return projects
+        names = sorted(deduped_repos, key=str.lower)
+        graphql = await _graphql_repositories(client, names)
+        projects = await _projects_from_graphql(client, get, graphql)
+        return projects, set(names)
 
 
 async def get_projects_to_prune(

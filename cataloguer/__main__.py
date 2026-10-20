@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import csv
 import datetime as dt
+import json
 import logging
 import os
 import sys
@@ -42,6 +43,12 @@ def main():
         "--merge", action="store_true", help="merge with existing `OUTCSV`"
     )
     collect_parser.add_argument(
+        "--full", action="store_true", help="rebuild from all discovery queries"
+    )
+    collect_parser.add_argument(
+        "--state", default="catalogue-state.json", help="incremental refresh state"
+    )
+    collect_parser.add_argument(
         "--search-user",
         action="append",
         dest="search_users",
@@ -74,28 +81,52 @@ def _with_outcsv(outcsv: str, mode: OpenTextMode = "r"):
 
 def _collect(args: argparse.Namespace):
     search_users: list[str] = args.search_users
-    projects = asyncio.run(
-        get_projects(
-            token=os.environ["RELEASE_JSON_ADDONS_GITHUB_TOKEN"],
-            search_params=tuple(("user_repositories", u) for u in search_users)
-            if search_users
-            else None,
-        )
-    )
-
     if args.merge:
         with _with_outcsv(args.outcsv) as outcsv_file:
             csv_reader = csv.DictReader(outcsv_file)
             rows = {r["id"]: r for r in csv_reader}
+        existing = [Project.from_csv_row(row) for row in rows.values()]
     else:
         rows = {}
+        existing = []
+    since = None
+    if not args.full and not search_users:
+        try:
+            with open(args.state, encoding="utf-8") as state_file:
+                value = json.load(state_file)["last_run"]
+            since = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            pass
 
-    rows |= {(r := p.to_csv_row())["id"]: r for p in projects}
+    projects, examined = asyncio.run(
+        get_projects(
+            token=os.environ["RELEASE_JSON_ADDONS_GITHUB_TOKEN"],
+            existing=existing,
+            full=args.full,
+            search_params=tuple(("user_repositories", u) for u in search_users)
+            if search_users
+            else None,
+            since=since,
+        )
+    )
+    examined_lower = {name.lower() for name in examined}
+    rows = {
+        key: row for key, row in rows.items() if row["full_name"].lower() not in examined_lower
+    }
+    rows |= {(row := project.to_csv_row())["id"]: row for project in projects}
 
     with _with_outcsv(args.outcsv, "w") as outcsv_file:
         csv_writer = csv.DictWriter(outcsv_file, PROJECT_FIELD_NAMES)
         csv_writer.writeheader()
-        csv_writer.writerows(sorted(rows.values(), key=lambda r: r["full_name"].lower()))
+        csv_writer.writerows(
+            sorted(rows.values(), key=lambda row: (row["full_name"].lower(), row["name"].lower()))
+        )
+    if not search_users:
+        temporary = args.state + ".tmp"
+        with open(temporary, "w", encoding="utf-8") as state_file:
+            json.dump({"last_run": dt.datetime.now(dt.UTC).isoformat()}, state_file)
+            state_file.write("\n")
+        os.replace(temporary, args.state)
 
 
 def _prune_or_update(args: argparse.Namespace):

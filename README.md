@@ -1,16 +1,23 @@
-# github-wow-addon-catalogue
+# Forever github-wow-addon-catalogue
 
-Script to harvest World of Warcraft add-on medata which are hosted on GitHub
-and co-located catalogue.
-Requires Python 3.11 or later to run.
+Forever Launcher's GPL-3.0 add-on catalogue, derived from
+[layday/github-wow-addon-catalogue](https://github.com/layday/github-wow-addon-catalogue).
+It keeps the upstream CSV columns and adds optional release-stream, asset-name
+and folder columns used by Forever's AddonForge build.
 
 ## Usage
 
-1. Clone this repo and `cd` into it
-1. Generate a GitHub token and expose it in your environment as
-   `RELEASE_JSON_ADDONS_GITHUB_TOKEN`
-1. Provided that you have [`pipx`](https://github.com/pypa/pipx) installed:
-   `pipx run --spec . cataloguer`
+Requires Python 3.12 or later. Set `RELEASE_JSON_ADDONS_GITHUB_TOKEN`, then:
+
+```sh
+uv run python -m cataloguer collect --merge
+```
+
+The default is an incremental refresh from `catalogue-state.json`. Pass
+`--full` for all discovery queries. GitHub Actions runs the incremental refresh
+daily and also supports manual full runs. Discovery validates release ZIPs by
+reading their central directory and top-level TOCs; generic tag-stream and
+distinct multi-ZIP releases become separate installable rows.
 
 ## Adoption
 
