@@ -114,6 +114,9 @@ def _collect(args: argparse.Namespace):
         key: row for key, row in rows.items() if row["full_name"].lower() not in examined_lower
     }
     rows |= {(row := project.to_csv_row())["id"]: row for project in projects}
+    for row in rows.values():
+        if row.get("asset_name_pattern") or row.get("release_tag_prefix"):
+            row["description"] = row["description"].replace(" · ", " - ")
 
     with _with_outcsv(args.outcsv, "w") as outcsv_file:
         csv_writer = csv.DictWriter(outcsv_file, PROJECT_FIELD_NAMES)

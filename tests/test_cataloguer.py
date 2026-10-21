@@ -125,6 +125,8 @@ class CatalogueRowsTest(unittest.TestCase):
         self.assertEqual(future_row.asset_name_pattern, "FuturePack-1.zip")
         self.assertEqual(future_row.folders, ("FuturePack",))
         self.assertIn("452 MiB", future_row.description)
+        self.assertIn(" - 452 MiB", future_row.description)
+        self.assertTrue(future_row.description.isascii())
         self.assertEqual(future_row.name, "Future Audio (All)")
 
     def test_multi_zip_distinct_addons_split_same_folder_variants_do_not(self):

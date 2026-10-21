@@ -450,7 +450,7 @@ def _release_rows(
             name = repo.name
         size_mib = max(1, round(asset.size / (1024 * 1024)))
         description = (repo.description or "GitHub author release").strip()
-        description = f"{description} · {size_mib} MiB"
+        description = f"{description} - {size_mib} MiB"
         row_id = repo.id if not tag_prefix and len(groups) == 1 else f"{repo.id}:{safe_identity}"
         rows.append(
             Project(
