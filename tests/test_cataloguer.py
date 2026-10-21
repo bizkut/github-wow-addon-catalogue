@@ -9,6 +9,7 @@ from cataloguer import (
     ReleaseAsset,
     ReleaseInfo,
     RepositoryInfo,
+    _asset_pattern_matches,
     analyse_addon_zip,
     expand_repository_releases,
 )
@@ -147,6 +148,39 @@ class CatalogueRowsTest(unittest.TestCase):
         self.assertIn("LoreForever_Voice.zip", patterns)
         self.assertNotIn("LoreForever-nolib.zip", patterns)
         self.assertIn("Lore Forever", {row.name for row in rows})
+
+    def test_ids_and_patterns_stay_stable_across_release_versions(self):
+        main_info = analyse_addon_zip(
+            addon_zip(("Polestar/Polestar.toc", "## Interface: 16001")), "Polestar.zip"
+        )
+        recorder_info = analyse_addon_zip(
+            addon_zip(("Polestar_Recorder/Polestar_Recorder.toc", "## Interface: 16001")),
+            "Polestar_Recorder.zip",
+        )
+
+        def rows_for(version: str):
+            main = ReleaseAsset(
+                f"Polestar-{version}.zip", 10, "https://example/main", main_info
+            )
+            recorder = ReleaseAsset(
+                f"Polestar_Recorder-{version}.zip",
+                10,
+                "https://example/recorder",
+                recorder_info,
+            )
+            return expand_repository_releases(
+                self.repo,
+                [release(f"v{version}", main, recorder)],
+                now=dt.datetime(2026, 10, 21, tzinfo=dt.UTC),
+            )
+
+        old = next(row for row in rows_for("0.2.6") if row.folders == ("Polestar",))
+        new = next(row for row in rows_for("0.2.7") if row.folders == ("Polestar",))
+        self.assertEqual(old.id, "1234:polestar-zip")
+        self.assertEqual(old.id, new.id)
+        self.assertEqual(old.asset_name_pattern, "Polestar-*.zip")
+        self.assertEqual(old.asset_name_pattern, new.asset_name_pattern)
+        self.assertTrue(_asset_pattern_matches(old.asset_name_pattern, "Polestar-0.2.7.zip"))
 
 
 if __name__ == "__main__":

@@ -376,6 +376,49 @@ def _display_words(value: str) -> str:
     return f"{words} (All)" if value.lower().endswith("-audio") else words
 
 
+def _asset_pattern_matches(pattern: str, name: str) -> bool:
+    first, separator, second = pattern.lower().partition("*")
+    if not separator:
+        return name.lower() == first
+    if "*" in second:
+        return False
+    name = name.lower()
+    return (
+        len(name) >= len(first) + len(second)
+        and name.startswith(first)
+        and name.endswith(second)
+    )
+
+
+def _version_free_asset_pattern(release: ReleaseInfo, asset: ReleaseAsset) -> str:
+    version = release.tag_name.rsplit("/", 1)[-1].removeprefix("v").removeprefix("V")
+    variants = {
+        version,
+        version.replace(".", "-"),
+        version.replace(".", "_"),
+        "v" + version,
+        "V" + version,
+    }
+    zip_names = [
+        candidate.name
+        for candidate in release.assets
+        if candidate.name.lower().endswith(".zip")
+    ]
+    for variant in sorted(filter(None, variants), key=len, reverse=True):
+        match = re.search(re.escape(variant), asset.name, re.I)
+        if not match:
+            continue
+        pattern = asset.name[: match.start()] + "*" + asset.name[match.end() :]
+        if sum(_asset_pattern_matches(pattern, name) for name in zip_names) == 1:
+            return pattern
+    logger.warning(
+        "release asset needs an exact versioned selector",
+        release=release.tag_name,
+        asset=asset.name,
+    )
+    return asset.name
+
+
 def _release_rows(
     repo: RepositoryInfo,
     release: ReleaseInfo,
@@ -394,7 +437,8 @@ def _release_rows(
         )
         analysis = asset.analysis
         assert analysis is not None
-        identity = tag_prefix.rstrip("/") if tag_prefix else asset.name
+        pattern = _version_free_asset_pattern(release, asset)
+        identity = tag_prefix.rstrip("/") if tag_prefix else pattern
         safe_identity = re.sub(r"[^a-z0-9]+", "-", identity.lower()).strip("-")
         if tag_prefix:
             name = _display_words(identity)
@@ -423,7 +467,7 @@ def _release_rows(
                 has_release_json=False,
                 last_seen=now,
                 release_tag_prefix=tag_prefix,
-                asset_name_pattern=asset.name,
+                asset_name_pattern=pattern,
                 folders=folders,
             )
         )
