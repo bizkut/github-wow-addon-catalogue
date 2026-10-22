@@ -18,6 +18,10 @@ The default is an incremental refresh from `catalogue-state.json`. Pass
 daily and also supports manual full runs. Discovery validates release ZIPs by
 reading their central directory and top-level TOCs; generic tag-stream and
 distinct multi-ZIP releases become separate installable rows.
+Release discovery follows every page of a repository's release history, so older
+independent tag streams remain installable even in repositories with over 100
+releases. When GitHub requires smaller query pages, that repository keeps its
+successful page size for subsequent pages.
 
 ## Adoption
 

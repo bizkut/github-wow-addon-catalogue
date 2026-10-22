@@ -602,19 +602,22 @@ async def _graphql_repositories(
     client: aiohttp.ClientSession,
     names: Sequence[str],
 ) -> list[dict[str, Any]]:
-    async def query(batch: Sequence[str], release_count: int = 100) -> list[dict[str, Any]]:
+    async def query(
+        batch: Sequence[str], release_count: int = 100, cursor: str | None = None
+    ) -> list[tuple[dict[str, Any], int]]:
         declarations = ", ".join(
             f"$owner{i}:String!,$name{i}:String!" for i in range(len(batch))
         )
         fields = "\n".join(
             f"r{i}:repository(owner:$owner{i},name:$name{i}){{"
             "databaseId name nameWithOwner url description "
-            f"releases(first:{release_count},orderBy:{{field:CREATED_AT,direction:DESC}}){{"
-            "nodes{tagName publishedAt isPrerelease isDraft "
+            f"releases(first:{release_count},after:$cursor,"
+            "orderBy:{field:CREATED_AT,direction:DESC}){"
+            "pageInfo{endCursor hasNextPage} nodes{tagName publishedAt isPrerelease isDraft "
             "releaseAssets(first:100){nodes{name size downloadUrl}}}}}"
             for i in range(len(batch))
         )
-        variables = {
+        variables: dict[str, str | None] = {
             key: value
             for i, full_name in enumerate(batch)
             for key, value in (
@@ -622,29 +625,45 @@ async def _graphql_repositories(
                 (f"name{i}", full_name.split("/", 1)[1]),
             )
         }
+        variables["cursor"] = cursor
         async with client.post(
             "https://api.github.com/graphql",
-            json={"query": f"query({declarations}){{{fields}}}", "variables": variables},
+            json={
+                "query": f"query({declarations},$cursor:String){{{fields}}}",
+                "variables": variables,
+            },
         ) as response:
             payload = await response.json()
         if response.status < 400 and not payload.get("errors"):
-            return [value for value in payload["data"].values() if value]
+            return [(value, release_count) for value in payload["data"].values() if value]
         if len(batch) > 1:
             middle = len(batch) // 2
             left, right = await asyncio.gather(
-                query(batch[:middle], release_count),
-                query(batch[middle:], release_count),
+                query(batch[:middle], release_count, cursor),
+                query(batch[middle:], release_count, cursor),
             )
             return left + right
         if release_count > 20:
-            return await query(batch, 20)
+            return await query(batch, 20, cursor)
         logger.warning("GitHub GraphQL repository skipped", repository=batch[0],
                        errors=payload.get("errors", response.status))
         return []
 
     rows: list[dict[str, Any]] = []
     for batch_start in range(0, len(names), 5):
-        rows.extend(await query(names[batch_start : batch_start + 5]))
+        for row, release_count in await query(names[batch_start : batch_start + 5]):
+            releases = row["releases"]
+            while releases["pageInfo"]["hasNextPage"]:
+                page = await query(
+                    [row["nameWithOwner"]], release_count, releases["pageInfo"]["endCursor"]
+                )
+                if not page:
+                    message = f"Incomplete release history for {row['nameWithOwner']}"
+                    raise RuntimeError(message)
+                next_row, release_count = page[0]
+                releases["nodes"].extend(next_row["releases"]["nodes"])
+                releases["pageInfo"] = next_row["releases"]["pageInfo"]
+            rows.append(row)
     return rows
 
 
