@@ -20,8 +20,7 @@ reading their central directory and top-level TOCs; generic tag-stream and
 distinct multi-ZIP releases become separate installable rows.
 Release discovery follows every page of a repository's release history, so older
 independent tag streams remain installable even in repositories with over 100
-releases. When GitHub requires smaller query pages, that repository keeps its
-successful page size for subsequent pages.
+releases. This also applies when GitHub requires smaller query pages.
 
 ## Adoption
 
