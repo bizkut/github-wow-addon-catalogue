@@ -604,7 +604,7 @@ async def _graphql_repositories(
 ) -> list[dict[str, Any]]:
     async def query(
         batch: Sequence[str], release_count: int = 100, cursor: str | None = None
-    ) -> list[dict[str, Any]]:
+    ) -> list[tuple[dict[str, Any], int]]:
         declarations = ", ".join(
             f"$owner{i}:String!,$name{i}:String!" for i in range(len(batch))
         )
@@ -635,7 +635,7 @@ async def _graphql_repositories(
         ) as response:
             payload = await response.json()
         if response.status < 400 and not payload.get("errors"):
-            return [value for value in payload["data"].values() if value]
+            return [(value, release_count) for value in payload["data"].values() if value]
         if len(batch) > 1:
             middle = len(batch) // 2
             left, right = await asyncio.gather(
@@ -651,17 +651,18 @@ async def _graphql_repositories(
 
     rows: list[dict[str, Any]] = []
     for batch_start in range(0, len(names), 5):
-        for row in await query(names[batch_start : batch_start + 5]):
+        for row, release_count in await query(names[batch_start : batch_start + 5]):
             releases = row["releases"]
             while releases["pageInfo"]["hasNextPage"]:
                 page = await query(
-                    [row["nameWithOwner"]], cursor=releases["pageInfo"]["endCursor"]
+                    [row["nameWithOwner"]], release_count, releases["pageInfo"]["endCursor"]
                 )
                 if not page:
                     message = f"Incomplete release history for {row['nameWithOwner']}"
                     raise RuntimeError(message)
-                releases["nodes"].extend(page[0]["releases"]["nodes"])
-                releases["pageInfo"] = page[0]["releases"]["pageInfo"]
+                next_row, release_count = page[0]
+                releases["nodes"].extend(next_row["releases"]["nodes"])
+                releases["pageInfo"] = next_row["releases"]["pageInfo"]
             rows.append(row)
     return rows
 

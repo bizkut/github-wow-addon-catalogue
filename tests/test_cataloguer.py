@@ -276,6 +276,10 @@ class ReleaseDiscoveryTest(unittest.IsolatedAsyncioTestCase):
             ],
             [None, "page-1", "page-2"],
         )
+        self.assertEqual(
+            [100 if "releases(first:100," in call["query"] else 20 for call in calls],
+            [100, 20, 20, 20] if fallback else [100, 100, 100],
+        )
 
         @asynccontextmanager
         async def get(url, *, headers, expire_after):
