@@ -1,7 +1,9 @@
-# ruff: noqa: PT009
+# ruff: noqa: PT009, PT027
 import datetime as dt
 import io
 import unittest
+from contextlib import asynccontextmanager
+from unittest.mock import AsyncMock
 from zipfile import ZipFile
 
 from cataloguer import (
@@ -10,6 +12,8 @@ from cataloguer import (
     ReleaseInfo,
     RepositoryInfo,
     _asset_pattern_matches,
+    _graphql_repositories,
+    _projects_from_graphql,
     analyse_addon_zip,
     expand_repository_releases,
 )
@@ -183,6 +187,189 @@ class CatalogueRowsTest(unittest.TestCase):
         self.assertEqual(old.asset_name_pattern, "Polestar-*.zip")
         self.assertEqual(old.asset_name_pattern, new.asset_name_pattern)
         self.assertTrue(_asset_pattern_matches(old.asset_name_pattern, "Polestar-0.2.7.zip"))
+
+
+class ReleaseDiscoveryTest(unittest.IsolatedAsyncioTestCase):
+    async def discover(self, *, fallback: bool = False):
+        spoken = {
+            "databaseId": 1360371543,
+            "name": "spoken-wow",
+            "nameWithOwner": "rusty-key/spoken-wow",
+            "url": "https://github.com/rusty-key/spoken-wow",
+            "description": "Spoken",
+        }
+        contents = addon_zip(
+            ("SpokenZonesAudio_ptBR/SpokenZonesAudio_ptBR.toc", "## Interface: 16001")
+        )
+        asset = ReleaseAsset(
+            "SpokenZonesAudio_ptBR-2.0.0.zip",
+            len(contents),
+            "https://example/places.zip",
+        )
+
+        def node(tag: str, assets=()):
+            return {
+                "tagName": tag,
+                "publishedAt": "2026-09-26T17:48:33Z",
+                "isPrerelease": False,
+                "isDraft": False,
+                "releaseAssets": {"nodes": list(assets)},
+            }
+
+        def connection(nodes, cursor, more):
+            return {
+                "nodes": nodes,
+                "pageInfo": {"endCursor": cursor, "hasNextPage": more},
+            }
+
+        calls = []
+        page_size = 20 if fallback else 100
+
+        @asynccontextmanager
+        async def post(url, *, json):
+            calls.append(json)
+            query = json["query"]
+            if fallback and "first:100," in query:
+                payload = {"errors": [{"message": "Query too expensive"}]}
+            else:
+                cursor = json["variables"].get("cursor")
+                if cursor is None:
+                    releases = connection(
+                        [node(f"spoken/v{i}") for i in range(page_size, 0, -1)], "page-1", True
+                    )
+                elif cursor == "page-1":
+                    releases = connection([node("manager/v1.0.0")], "page-2", True)
+                else:
+                    self.assertEqual(cursor, "page-2")
+                    releases = connection(
+                        [
+                            node(
+                                "zones-audio-ptBR/v2.0.0",
+                                [
+                                    {
+                                        "name": asset.name,
+                                        "size": asset.size,
+                                        "downloadUrl": asset.download_url,
+                                    }
+                                ],
+                            )
+                        ],
+                        "page-3",
+                        False,
+                    )
+                payload = {"data": {"r0": spoken | {"releases": releases}}}
+            response = AsyncMock(status=200)
+            response.json.return_value = payload
+            yield response
+
+        client = AsyncMock()
+        client.post = post
+        repositories = await _graphql_repositories(client, ["rusty-key/spoken-wow"])
+        self.assertEqual(len(repositories), 1)
+        self.assertEqual(len(repositories[0]["releases"]["nodes"]), page_size + 2)
+        self.assertTrue(all("pageInfo" in call["query"] for call in calls))
+        self.assertEqual(
+            [
+                call["variables"].get("cursor")
+                for call in calls
+                if not fallback or "first:20," in call["query"]
+            ],
+            [None, "page-1", "page-2"],
+        )
+
+        @asynccontextmanager
+        async def get(url, *, headers, expire_after):
+            self.assertEqual(url, asset.download_url)
+            self.assertEqual(expire_after, 0)
+            start, end = map(int, headers["Range"].removeprefix("bytes=").split("-"))
+            response = AsyncMock(status=206)
+            response.read.return_value = contents[start : end + 1]
+            yield response
+
+        projects = await _projects_from_graphql(client, get, repositories)
+        self.assertEqual(len(projects), 1)
+        project = next(iter(projects))
+        self.assertEqual(project.id, "1360371543:zones-audio-ptbr")
+        self.assertEqual(project.release_tag_prefix, "zones-audio-ptBR/")
+        self.assertEqual(project.asset_name_pattern, "SpokenZonesAudio_ptBR-*.zip")
+        self.assertEqual(project.folders, ("SpokenZonesAudio_ptBR",))
+        self.assertEqual({str(flavor) for flavor in project.flavors}, {"forever"})
+
+    async def test_valid_stream_beyond_first_hundred_releases_is_discovered(self):
+        await self.discover()
+
+    async def test_reduced_page_size_fallback_also_paginates(self):
+        await self.discover(fallback=True)
+
+    async def test_batched_repositories_keep_independent_release_cursors(self):
+        first = {
+            "nameWithOwner": "owner/first",
+            "releases": {
+                "nodes": [{"tagName": "first/v2"}],
+                "pageInfo": {"endCursor": "first-page", "hasNextPage": True},
+            },
+        }
+        second = {
+            "nameWithOwner": "owner/second",
+            "releases": {
+                "nodes": [],
+                "pageInfo": {"endCursor": None, "hasNextPage": False},
+            },
+        }
+        last = {
+            "nameWithOwner": "owner/first",
+            "releases": {
+                "nodes": [{"tagName": "other/v1"}],
+                "pageInfo": {"endCursor": "last-page", "hasNextPage": False},
+            },
+        }
+        calls = []
+
+        @asynccontextmanager
+        async def post(url, *, json):
+            calls.append(json["variables"])
+            response = AsyncMock(status=200)
+            response.json.return_value = {
+                "data": {"r0": first, "r1": second} if len(calls) == 1 else {"r0": last}
+            }
+            yield response
+
+        client = AsyncMock()
+        client.post = post
+        rows = await _graphql_repositories(client, ["owner/first", "owner/second"])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1], {"owner0": "owner", "name0": "first", "cursor": "first-page"})
+        self.assertEqual(
+            [node["tagName"] for node in rows[0]["releases"]["nodes"]],
+            ["first/v2", "other/v1"],
+        )
+        self.assertEqual(rows[1]["releases"]["nodes"], [])
+
+    async def test_failed_later_page_does_not_publish_a_truncated_history(self):
+        @asynccontextmanager
+        async def post(url, *, json):
+            response = AsyncMock(status=200)
+            response.json.return_value = (
+                {"errors": [{"message": "Unavailable"}]}
+                if json["variables"].get("cursor")
+                else {
+                    "data": {
+                        "r0": {
+                            "nameWithOwner": "owner/pack",
+                            "releases": {
+                                "nodes": [],
+                                "pageInfo": {"endCursor": "page-1", "hasNextPage": True},
+                            },
+                        }
+                    }
+                }
+            )
+            yield response
+
+        client = AsyncMock()
+        client.post = post
+        with self.assertRaisesRegex(RuntimeError, "Incomplete release history for owner/pack"):
+            await _graphql_repositories(client, ["owner/pack"])
 
 
 if __name__ == "__main__":
