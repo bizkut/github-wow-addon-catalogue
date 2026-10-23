@@ -20,7 +20,7 @@ from zipfile import BadZipFile, ZipFile
 import aiohttp
 import structlog
 from aiohttp_client_cache.cache_control import ExpirationPatterns
-from attrs import field, fields, frozen
+from attrs import evolve, field, fields, frozen
 from cattrs import BaseValidationError, Converter
 from yarl import URL
 
@@ -226,7 +226,7 @@ _addons_csv_converter.register_structure_hook(
 )
 _addons_csv_converter.register_structure_hook(
     ProjectFlavors,
-    lambda v, _: [ReleaseJsonFlavor(f) for f in v.split(",") if f],
+    lambda v, _: ProjectFlavors(frozenset(ReleaseJsonFlavor(f) for f in v.split(",") if f)),
 )
 
 
@@ -271,6 +271,7 @@ class ReleaseAsset:
     size: int
     download_url: str
     analysis: ArchiveAnalysis | None = None
+    inspection_failed: bool = False
 
 
 @frozen
@@ -429,6 +430,8 @@ def _release_rows(
     for asset in release.assets:
         if asset.analysis is not None:
             groups.setdefault(asset.analysis.folders, []).append(asset)
+    split_assets = len(groups) > 1
+    incomplete = any(asset.inspection_failed for asset in release.assets)
     rows: list[Project] = []
     for folders, variants in groups.items():
         asset = next(
@@ -444,14 +447,19 @@ def _release_rows(
             name = _display_words(identity)
             if repo.name.lower().startswith("spoken") and not name.lower().startswith("spoken"):
                 name = f"Spoken {name}"
-        elif len(groups) > 1:
+        elif split_assets or incomplete:
             name = _display_words(folders[0])
         else:
             name = repo.name
         size_mib = max(1, round(asset.size / (1024 * 1024)))
         description = (repo.description or "GitHub author release").strip()
         description = f"{description} - {size_mib} MiB"
-        row_id = repo.id if not tag_prefix and len(groups) == 1 else f"{repo.id}:{safe_identity}"
+        # Without a complete inspection or matching cached identity, use the
+        # observed asset's identity rather than mislabelling it as the base add-on.
+        row_id = (
+            repo.id if not tag_prefix and not split_assets and not incomplete
+            else f"{repo.id}:{safe_identity}"
+        )
         rows.append(
             Project(
                 id=row_id,
@@ -671,6 +679,8 @@ async def _projects_from_graphql(
     client: aiohttp.ClientSession,
     get: _Get,
     repositories: Sequence[dict[str, Any]],
+    *,
+    existing: Sequence[Project] = (),
 ) -> set[Project]:
     semaphore = asyncio.Semaphore(16)
 
@@ -680,9 +690,15 @@ async def _projects_from_graphql(
         async with semaphore:
             try:
                 analysis = await _analyse_remote_zip(get, asset)
-            except (aiohttp.ClientError, OSError, ValueError, zlib.error):
-                logger.warning("unable to inspect add-on ZIP", asset=asset.download_url)
-                analysis = None
+            except (aiohttp.ClientError, OSError, ValueError, zlib.error) as error:
+                logger.warning(
+                    "unable to inspect add-on ZIP; preserving matching catalogue rows",
+                    asset=asset.download_url,
+                    error=str(error),
+                )
+                return ReleaseAsset(
+                    asset.name, asset.size, asset.download_url, inspection_failed=True
+                )
         return ReleaseAsset(asset.name, asset.size, asset.download_url, analysis)
 
     del client
@@ -725,7 +741,57 @@ async def _projects_from_graphql(
             )
 
         inspected = await asyncio.gather(*(inspect_release(release) for release in selected))
-        return set(expand_repository_releases(repo, inspected, now=now))
+        projects = set(expand_repository_releases(repo, inspected, now=now))
+        failed = [
+            (release.tag_name, asset.name)
+            for release in inspected
+            for asset in release.assets
+            if asset.inspection_failed
+        ]
+        previous = [
+            project for project in existing
+            if project.full_name.lower() == repo.full_name.lower()
+        ]
+        if failed:
+            # Missing ZIPs do not prove there are distinct packages: a failed
+            # sibling may be another variant of the same folder group (nolib).
+            # Preserve an established group's identity, but use its freshly
+            # inspected selector, folders and timestamps.
+            stable: set[Project] = set()
+            for project in projects:
+                cached = next((
+                    candidate for candidate in previous
+                    if candidate.folders == project.folders
+                    and candidate.release_tag_prefix == project.release_tag_prefix
+                ), None)
+                stable.add(
+                    evolve(project, id=cached.id, name=cached.name)
+                    if cached is not None else project
+                )
+            projects = stable
+        for project in previous:
+            # Retain only the unavailable asset's last known metadata, not stale
+            # rows for other streams/assets. Legacy rows cannot identify an asset.
+            if project.asset_name_pattern and any(
+                (
+                    tag.startswith(project.release_tag_prefix)
+                    if project.release_tag_prefix
+                    else not _STREAM_TAG.match(tag)
+                )
+                and _asset_pattern_matches(project.asset_name_pattern, name)
+                for tag, name in failed
+            ):
+                if not any(
+                    row.id == project.id or (
+                        row.folders == project.folders
+                        and row.release_tag_prefix == project.release_tag_prefix
+                    )
+                    for row in projects
+                ):
+                    projects.add(project)
+            elif failed and not projects and not project.asset_name_pattern:
+                projects.add(project)
+        return projects
 
     output: set[Project] = set()
     for projects in await asyncio.gather(*(process(row) for row in repositories)):
@@ -1062,7 +1128,7 @@ async def get_projects(
         }
         names = sorted(deduped_repos, key=str.lower)
         graphql = await _graphql_repositories(client, names)
-        projects = await _projects_from_graphql(client, get, graphql)
+        projects = await _projects_from_graphql(client, get, graphql, existing=existing)
         return projects, set(names)
 
 
